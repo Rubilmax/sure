@@ -15,8 +15,8 @@ class Provider::Binance
   attr_reader :api_key, :api_secret
 
   def initialize(api_key:, api_secret:)
-    @api_key = api_key
-    @api_secret = api_secret
+    instance_variable_set(:@api_key, api_key)
+    instance_variable_set(:@api_secret, api_secret)
   end
 
   def get_account(omit_zero_balances: true)

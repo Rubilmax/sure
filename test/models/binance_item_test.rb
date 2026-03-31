@@ -34,11 +34,10 @@ class BinanceItemTest < ActiveSupport::TestCase
   end
 
   test "credentials_configured? returns false when credentials are missing" do
-    @binance_item.api_key = nil
+    @binance_item.assign_attributes(api_key: nil)
     refute @binance_item.credentials_configured?
 
-    @binance_item.api_key = "test_key"
-    @binance_item.api_secret = nil
+    @binance_item.assign_attributes(api_key: "test_key", api_secret: nil)
     refute @binance_item.credentials_configured?
   end
 
