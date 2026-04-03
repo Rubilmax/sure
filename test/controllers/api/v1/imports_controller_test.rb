@@ -2,9 +2,9 @@ require "test_helper"
 
 class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
   setup do
-    @family = families(:dylan_family)
     @user = users(:family_admin)
     @member = users(:family_member)
+    @family = @user.family
     @account = accounts(:depository)
     @private_account = accounts(:investment)
     @import = imports(:transaction)
@@ -14,12 +14,39 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
       account: @private_account,
       raw_file_str: "date,amount,name\n2023-01-01,-10.00,Private Transaction"
     )
-    @token = valid_token_for(@user)
-    @member_token = valid_token_for(@member)
+
+    @user.api_keys.active.destroy_all
+    @member.api_keys.active.destroy_all
+
+    @api_key = ApiKey.create!(
+      user: @user,
+      name: "Test Read-Write Key",
+      scopes: [ "read_write" ],
+      display_key: "test_rw_#{SecureRandom.hex(8)}"
+    )
+
+    @read_only_api_key = ApiKey.create!(
+      user: @user,
+      name: "Test Read-Only Key",
+      scopes: [ "read" ],
+      display_key: "test_ro_#{SecureRandom.hex(8)}",
+      source: "mobile"
+    )
+
+    @member_api_key = ApiKey.create!(
+      user: @member,
+      name: "Member Read-Write Key",
+      scopes: [ "read_write" ],
+      display_key: "member_rw_#{SecureRandom.hex(8)}"
+    )
+
+    Redis.new.del("api_rate_limit:#{@api_key.id}")
+    Redis.new.del("api_rate_limit:#{@read_only_api_key.id}")
+    Redis.new.del("api_rate_limit:#{@member_api_key.id}")
   end
 
   test "should list imports" do
-    get api_v1_imports_url, headers: { Authorization: "Bearer #{@token}" }
+    get api_v1_imports_url, headers: api_headers(@api_key)
     assert_response :success
 
     json_response = JSON.parse(response.body)
@@ -28,7 +55,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "should exclude imports for inaccessible accounts" do
-    get api_v1_imports_url, headers: { Authorization: "Bearer #{@member_token}" }
+    get api_v1_imports_url, headers: api_headers(@member_api_key)
 
     assert_response :success
 
@@ -38,7 +65,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "should show import" do
-    get api_v1_import_url(@import), headers: { Authorization: "Bearer #{@token}" }
+    get api_v1_import_url(@import), headers: api_headers(@api_key)
     assert_response :success
 
     json_response = JSON.parse(response.body)
@@ -47,7 +74,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
   end
 
   test "should not show import for inaccessible account" do
-    get api_v1_import_url(@private_import), headers: { Authorization: "Bearer #{@member_token}" }
+    get api_v1_import_url(@private_import), headers: api_headers(@member_api_key)
 
     assert_response :not_found
   end
@@ -64,7 +91,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
              name_col_label: "name",
              account_id: @account.id
            },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :created
@@ -87,7 +114,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
              name_col_label: "name",
              account_id: @account.id
            },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :created
@@ -97,6 +124,44 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_equal 1, import.rows_count
     assert_equal "Test Transaction", import.rows.first.name
     assert_equal "-10.00", import.rows.first.amount # Normalized
+  end
+
+  test "should instantiate RuleImport before generating rows" do
+    @family.categories.create!(
+      name: "Groceries",
+      color: "#407706",
+      lucide_icon: "shopping-basket"
+    )
+
+    csv_content = <<~CSV
+      name,resource_type,active,effective_date,conditions,actions
+      "Categorize groceries","transaction",true,2024-01-01,"[{""condition_type"":""transaction_name"",""operator"":""like"",""value"":""grocery""}]","[{""action_type"":""set_transaction_category"",""value"":""Groceries""}]"
+    CSV
+
+    assert_difference([ "Import.count", "Import::Row.count" ], 1) do
+      post api_v1_imports_url,
+           params: {
+             type: "RuleImport",
+             raw_file_content: csv_content,
+             col_sep: ","
+           },
+           headers: api_headers(@api_key)
+    end
+
+    assert_response :created
+
+    json_response = JSON.parse(response.body)
+    import = Import.find(json_response["data"]["id"])
+    row = import.rows.first
+
+    assert_instance_of RuleImport, import
+    assert_equal 1, import.rows_count
+    assert_equal "Categorize groceries", row.name
+    assert_equal "transaction", row.resource_type
+    assert_equal true, row.active
+    assert_equal "2024-01-01", row.effective_date
+    assert_equal '[{"condition_type":"transaction_name","operator":"like","value":"grocery"}]', row.conditions
+    assert_equal '[{"action_type":"set_transaction_category","value":"Groceries"}]', row.actions
   end
 
   test "should create import and auto-publish when configured and requested" do
@@ -113,7 +178,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
              date_format: "%Y-%m-%d",
              publish: "true"
            },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :created
@@ -133,7 +198,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
             raw_file_content: csv_content,
             account_id: other_account.id
           },
-          headers: { Authorization: "Bearer #{@token}" }
+          headers: api_headers(@api_key)
 
     assert_response :not_found
   end
@@ -147,7 +212,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
              raw_file_content: csv_content,
              account_id: @private_account.id
            },
-           headers: { Authorization: "Bearer #{@member_token}" }
+           headers: api_headers(@member_api_key)
     end
 
     assert_response :not_found
@@ -163,7 +228,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_no_difference("Import.count") do
       post api_v1_imports_url,
            params: { file: large_file },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :unprocessable_entity
@@ -181,7 +246,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_no_difference("Import.count") do
       post api_v1_imports_url,
            params: { file: invalid_file },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :unprocessable_entity
@@ -201,7 +266,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
     assert_no_difference("Import.count") do
       post api_v1_imports_url,
            params: { raw_file_content: large_content },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :unprocessable_entity
@@ -229,7 +294,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
              name_col_label: "name",
              account_id: @account.id
            },
-           headers: { Authorization: "Bearer #{@token}" }
+           headers: api_headers(@api_key)
     end
 
     assert_response :created
@@ -237,8 +302,7 @@ class Api::V1::ImportsControllerTest < ActionDispatch::IntegrationTest
 
   private
 
-    def valid_token_for(user)
-      application = Doorkeeper::Application.create!(name: "Test App", redirect_uri: "urn:ietf:wg:oauth:2.0:oob", scopes: "read read_write")
-      Doorkeeper::AccessToken.create!(application: application, resource_owner_id: user.id, scopes: "read read_write").token
+    def api_headers(api_key)
+      { "X-Api-Key" => api_key.display_key }
     end
 end
